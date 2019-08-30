@@ -9,17 +9,17 @@ from datetime import datetime
 from functools import wraps
 from json import loads
 from os import getenv, path
-from ssl import PROTOCOL_TLSv1_2, SSLContext
+from sys import path as sys_path
+
+# add vendor directory
+parent_dir = path.abspath(path.dirname(__file__))
+vendor_dir = path.join(parent_dir, 'vendor')
+sys_path.append(vendor_dir)
 
 # Third party library imports
 from flask import Flask, render_template, request, Response, redirect, send_from_directory
 from requests import post, put
 from requests.exceptions import ConnectionError
-from urllib3 import disable_warnings
-from werkzeug import secure_filename
-
-# Disable HTTPs warnings
-disable_warnings()
 
 # Debug
 # from pdb import set_trace as st
@@ -32,6 +32,17 @@ APP.config['HEADERS'] = {
     'User-Agent': 'CASSH-WEB-CLIENT v%s' % APP.config['VERSION'],
     'CLIENT_VERSION': APP.config['VERSION'],
 }
+
+if APP.config['DEBUG']:
+    import http.client as http_client
+    import logging
+
+    http_client.HTTPConnection.debuglevel = 1
+    logging.basicConfig()
+    logging.getLogger().setLevel(logging.DEBUG)
+    requests_log = logging.getLogger("requests.packages.urllib3")
+    requests_log.setLevel(logging.DEBUG)
+    requests_log.propagate = True
 
 def allowed_file(filename):
     """ For a given file, return whether it's an allowed type or not """
@@ -231,7 +242,5 @@ def page_not_found(_):
     return render_template('404.html'), 404
 
 if __name__ == '__main__':
-    CONTEXT = SSLContext(PROTOCOL_TLSv1_2)
-    CONTEXT.load_cert_chain(APP.config['SSL_PUB_KEY'], APP.config['SSL_PRIV_KEY'])
     PORT = int(getenv('PORT', APP.config['PORT']))
-    APP.run(debug=APP.config['DEBUG'], host='0.0.0.0', port=PORT, ssl_context=CONTEXT)
+    APP.run(debug=APP.config['DEBUG'], host='0.0.0.0', port=PORT)

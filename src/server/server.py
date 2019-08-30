@@ -5,14 +5,20 @@ Sign a user's SSH public key.
 """
 from argparse import ArgumentParser
 from json import dumps
-from os import remove
+from os import remove, path as os_path
+from sys import path as sys_path
 from re import compile as re_compile, IGNORECASE
 from tempfile import NamedTemporaryFile
 from urllib.parse import unquote_plus
 
+# add vendor directory
+parent_dir = os_path.abspath(os_path.dirname(__file__))
+vendor_dir = os_path.join(parent_dir, 'vendor')
+sys_path.append(vendor_dir)
+
 # Third party library imports
 from configparser import ConfigParser, NoOptionError
-from ldap import initialize, SCOPE_SUBTREE
+from ldap3 import Server, Connection
 from web import application, config, data, httpserver
 from web.wsgiserver import CherryPyWSGIServer
 
@@ -63,7 +69,6 @@ try:
 except NoOptionError:
     SERVER_OPTS['admin_db_failover'] = False
 SERVER_OPTS['ldap'] = False
-SERVER_OPTS['ssl'] = False
 
 if CONFIG.has_section('postgres'):
     try:
@@ -80,22 +85,15 @@ if CONFIG.has_section('ldap'):
     try:
         SERVER_OPTS['ldap'] = True
         SERVER_OPTS['ldap_host'] = CONFIG.get('ldap', 'host')
-        SERVER_OPTS['ldap_bind_dn'] = CONFIG.get('ldap', 'bind_dn')
-        SERVER_OPTS['ldap_admin_cn'] = CONFIG.get('ldap', 'admin_cn')
-        SERVER_OPTS['filterstr'] = CONFIG.get('ldap', 'filterstr')
+        SERVER_OPTS['ldap_ssl'] = CONFIG.get('ldap', 'use_ssl') == "true"
+        SERVER_OPTS['ldap_account'] = CONFIG.get('ldap', 'account')
+        SERVER_OPTS['ldap_account_password'] = CONFIG.get('ldap', 'account_password')
+        SERVER_OPTS['ldap_base_dn'] = CONFIG.get('ldap', 'base_dn')
+        SERVER_OPTS['ldap_filter'] = CONFIG.get('ldap', 'filter')
+        SERVER_OPTS['ldap_login'] = CONFIG.get('ldap', 'login')
     except NoOptionError:
         if ARGS.verbose:
             print('Option reading error (ldap).')
-        exit(1)
-
-if CONFIG.has_section('ssl'):
-    try:
-        SERVER_OPTS['ssl'] = True
-        SERVER_OPTS['ssl_private_key'] = CONFIG.get('ssl', 'private_key')
-        SERVER_OPTS['ssl_public_key'] = CONFIG.get('ssl', 'public_key')
-    except NoOptionError:
-        if ARGS.verbose:
-            print('Option reading error (ssl).')
         exit(1)
 
 # Cluster mode is used for revocation
@@ -104,8 +102,6 @@ try:
 except NoOptionError:
     # Standalone mode
     PROTO = 'http'
-    if SERVER_OPTS['ssl']:
-        PROTO = 'https'
     SERVER_OPTS['cluster'] = ['%s://localhost:%s' % (PROTO, SERVER_OPTS['port'])]
 
 try:
@@ -151,22 +147,24 @@ def ldap_authentification(admin=False):
             return False, 'Error: No password option given.'
         if password == '':
             return False, 'Error: password is empty.'
-        ldap_conn = initialize("ldap://"+SERVER_OPTS['ldap_host'])
-        try:
-            ldap_conn.bind_s(realname, password)
-        except Exception as e:
-            return False, 'Error: %s' % e
+
+        server = Server(SERVER_OPTS['ldap_host'], use_ssl=SERVER_OPTS['ldap_ssl'])
+        if SERVER_OPTS['ldap_account']:
+            connection = Connection(server, user=SERVER_OPTS['ldap_account'], password=SERVER_OPTS['ldap_account_password'], raise_exceptions=True)
+        else:
+            connection = Connection(server, raise_exceptions=True)
+        connection.bind()
+        login_object = "(&(objectclass=user)({}={}))".format(SERVER_OPTS['ldap_login'], realname)
         if admin:
-            memberof_admin_list = ldap_conn.search_s(
-                SERVER_OPTS['ldap_bind_dn'],
-                SCOPE_SUBTREE,
-                filterstr='(&(%s=%s)(memberOf=%s))' % (
-                    SERVER_OPTS['filterstr'],
-                    realname,
-                    SERVER_OPTS['ldap_admin_cn']))
-            if not memberof_admin_list:
+            if not connection.search(SERVER_OPTS['ldap_base_dn'], "(&{}{})".format(login_object, SERVER_OPTS['ldap_filter'])):
                 return False, 'Error: user %s is not an admin.' % realname
-    return True, 'OK'
+        if connection.search(SERVER_OPTS['ldap_base_dn'], login_object):
+            entry = connection.entries[0]
+            try:
+                connection.rebind(entry.entry_dn, password)
+            except Exception as e:
+                return False, 'Error: %s' % e
+        return True, 'OK'
 
 class Admin():
     """
@@ -517,14 +515,14 @@ class Client():
                 'Error: No realname option given.',
                 http_code='400 Bad Request')
 
-        realname_pattern = re_compile(
-            r"(^[-!#$%&'*+/=?^_`{}|~0-9A-Z]+(\.[-!#$%&'*+/=?^_`{}|~0-9A-Z]+)*"
-            r'|^"([\001-\010\013\014\016-\037!#-\[\]-\177]|\\[\001-011\013\014\016-\177])*"'
-            r')@(?:[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?\.)+[A-Z]{2,6}\.?$', IGNORECASE)
-        if realname_pattern.match(realname) is None:
-            return response_render(
-                "Error: Realname doesn't match pattern",
-                http_code='400 Bad Request')
+#       realname_pattern = re_compile(
+#           r"(^[-!#$%&'*+/=?^_`{}|~0-9A-Z]+(\.[-!#$%&'*+/=?^_`{}|~0-9A-Z]+)*"
+#           r'|^"([\001-\010\013\014\016-\037!#-\[\]-\177]|\\[\001-011\013\014\016-\177])*"'
+#           r')@(?:[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?\.)+[A-Z]{2,6}\.?$', IGNORECASE)
+#       if realname_pattern.match(realname) is None:
+#           return response_render(
+#               "Error: Realname doesn't match pattern",
+#               http_code='400 Bad Request')
 
         # Get public key
         if 'pubkey' in payload:
@@ -669,11 +667,7 @@ class MyApplication(application):
         return httpserver.runsimple(func, ('0.0.0.0', port))
 
 if __name__ == "__main__":
-    if SERVER_OPTS['ssl']:
-        CherryPyWSGIServer.ssl_certificate = SERVER_OPTS['ssl_public_key']
-        CherryPyWSGIServer.ssl_private_key = SERVER_OPTS['ssl_private_key']
     if ARGS.verbose:
-        print('SSL: %s' % SERVER_OPTS['ssl'])
         print('LDAP: %s' % SERVER_OPTS['ldap'])
         print('Admin DB Failover: %s' % SERVER_OPTS['admin_db_failover'])
     APP = MyApplication(URLS, globals())
